@@ -26,6 +26,7 @@ import os
 
 from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
+import Parse_Answers_File
 
 api_key = "AIzaSyAlABTPGnaSlYkrWsmUwfmPjyq9tIjMsOs"  # Replace with your actual Google API key
 os.environ["GOOGLE_API_KEY"] = api_key
@@ -92,8 +93,6 @@ class ModuleAssessment(BaseModel):
     assessment: list[Questions] = Field(description="List of all the questions of all the learning objectives of the module")
 
 class Output(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
-
     course: str
     module: str
     objectives: List[str] = []
@@ -112,41 +111,26 @@ class Rubric(BaseModel):
     bloom_level: str = Field(description="The Bloom's Taxonomy level of the question.")
     criteria: List[Criterion] = Field(description="A list of criteria to evaluate the answer against.")
 
+class Criterion_Feedback(BaseModel):
+    """A specific criterion for evaluating an answer (e.g., Accuracy, Completeness)."""
+    criterion: str = Field(description="The name of the criterion being evaluated.")
+    feedback: str = Field(description="feedback on the user's answer")
+
+class EvaluationResult(BaseModel):
+    """The result of evaluating a single answer against a rubric."""
+    question_text: str = Field(description="The question that was answered.")
+    score: float = Field(description="The final calculated score for the answer, typically out of 100.")
+    justification: str = Field(description="A detailed explanation of how the score was determined based on the rubric criteria.")
+    criterion_feedback: List[Criterion_Feedback] = Field(description="Specific feedback for each criterion in the rubric.")
 
 llm1 = Settings.llm.as_structured_llm(Output)
 llm2 = Settings.llm.as_structured_llm(ModuleAssessment)
 llm3 = Settings.llm.as_structured_llm(Rubric)
+llm4 = Settings.llm.as_structured_llm(EvaluationResult)
 query_engine1 = index.as_query_engine(llm=llm1)
 query_engine2 = index.as_query_engine(llm=llm2)
 query_engine3 = index.as_query_engine(llm = llm3)
-
-# Format questions into a readable string
-def format_questions(questions_obj):
-    if not isinstance(questions_obj, Questions):
-        print("ERROR: Expected Questions object, got:", type(questions_obj))
-        return f"Invalid questions object: {str(questions_obj)}"
-    
-    if not questions_obj.objective:
-        print("WARNING: Questions object has empty objective.")
-        return "Objective: None\n  No questions available."
-    
-    result = [f"Objective: {questions_obj.objective}"]
-    has_questions = False
-    for level in ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create']:
-        questions_list = [q for q in getattr(questions_obj, level, []) if q.strip()]  # Filter out whitespace-only questions
-        print(f"DEBUG: Questions for {level}: {questions_list}")
-        if questions_list:
-            has_questions = True
-            result.append(f"  {level.capitalize()} Questions:")
-            for i, q in enumerate(questions_list, 1):
-                result.append(f"    {i}. {q}")
-        else:
-            result.append(f"  {level.capitalize()} Questions: None")
-    if not has_questions:
-        print("WARNING: No valid questions found in any Bloom's level.")
-        result.append("  No valid questions available for evaluation.")
-    return "\n".join(result).strip()
-
+query_engine4 = index.as_query_engine(llm=llm4)
 
 # ------ Events ------
 
@@ -157,6 +141,10 @@ class GetObjectives(Event):
 class SetAssessment(Event):
     """Event to set the assessment based on learning objectives."""
     query : str
+
+class RubrikEvent(Event):
+    query : str
+
 class EvalEvent(Event):
     query : str
 
@@ -193,7 +181,7 @@ class Objective_Workflow(Workflow):
         return SetAssessment(query = "Set Assessment") #EvalEvent(query = "Start Evaluation") 
     
     @step
-    async def assessment(self, ctx: Context, ev: SetAssessment) -> EvalEvent:
+    async def assessment(self, ctx: Context, ev: SetAssessment) -> RubrikEvent:
         """Generate questions based on each Bloom's Taxonomy level for each learning objectives."""
         course = await ctx.store.get("course")
         module = await ctx.store.get("module")
@@ -225,10 +213,10 @@ class Objective_Workflow(Workflow):
                     print()
             print("="*60 + "\n")
             
-        return EvalEvent(query = "Make Evaluation Rubrik")
+        return RubrikEvent(query = "Make Evaluation Rubrik")
     
     @step
-    async def evaluate_answers(self, ctx: Context, ev: EvalEvent) -> StopEvent:
+    async def evaluation_rubriks(self, ctx: Context, ev: RubrikEvent) -> EvalEvent:
         """Generate an evaluation rubrik for the generated questions"""
 
         # Fetch the module assessment from context store
@@ -245,7 +233,7 @@ class Objective_Workflow(Workflow):
         
         # The rest of the logic is the same, but it now operates only on the
         # single 'question_obj' instead of looping through all of them.
-        for bloom_level in ['analyze', 'create']:
+        for bloom_level in ['analyze']:
             questions_for_level = getattr(question_obj, bloom_level, [])
             
             for question_text in questions_for_level:
@@ -266,91 +254,82 @@ class Objective_Workflow(Workflow):
                 all_rubrics_for_objective.append(rubric_response)
                 print(f"--- Rubric generated successfully.")
 
-        await ctx.store.set("generated_rubrics_for_one_objective", all_rubrics_for_objective)
+        await ctx.store.set("generated_rubrics", all_rubrics_for_objective)
         print(f"\nSuccessfully generated and stored {len(all_rubrics_for_objective)} rubrics for the selected objective.")
 
+        return EvalEvent(query="Start the evaluation")
+    
+    @step
+    async def input_answers(self, ctx:Context, ev: EvalEvent)-> StopEvent:
+        """Evaluate a student's answers against the generated rubrics."""
+        print("Taking input from user...")
+        answers_file_path = input("Please provide the path to your answers file:")
+        print(f"Received file path from user: {answers_file_path}")
 
-        '''all_rubrics = []
+         # 1. Retrieve the rubrics from the context store
+        rubrics_data = await ctx.store.get("generated_rubrics", [])
+        if not rubrics_data:
+            print("ERROR: No rubrics found in context to evaluate against.")
+            return StopEvent(error="Rubrics not found.")
+
+        # 2. Define path to answers file and parse it
+        # You can change this path to point to the user's file.
         
-        # 2. Loop through every objective and every question
-        for question_obj in module_assessment.assessment:
-            objective_text = question_obj.objective
+        student_answers = Parse_Answers_File.parse_answers_file(answers_file_path)
+
+        final_evaluations = []
+        
+        # 3. Loop through each rubric object
+        for i, rubric_data in enumerate(rubrics_data):
+            try:
+                rubric = Rubric.model_validate(rubric_data)
+            except Exception as e:
+                print(f"Skipping an item that could not be parsed into a Rubric object: {e}")
+                continue
             
-            for bloom_level in ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create']:
-                questions_for_level = getattr(question_obj, bloom_level, [])
-                
-                for question_text in questions_for_level:
-                    if not question_text.strip(): continue # Skip empty questions
-
-                    print(f"--- Generating rubric for: '{question_text[:50]}...' (Level: {bloom_level.capitalize()})")
-
-                    # 3. Create a highly specific prompt for ONE question
-                    prompt = (
-                        f"You are an expert instructional designer. Your task is to create a detailed, "
-                        f"weighted evaluation rubric for the following question.\n\n"
-                        f"**Learning Objective:** {objective_text}\n"
-                        f"**Bloom's Taxonomy Level:** {bloom_level.capitalize()}\n"
-                        f"**Question:** \"{question_text}\"\n\n"
-                        f"The rubric must have 2-4 weighted criteria (e.g., Accuracy, Completeness, Clarity, Depth of Analysis). "
-                        f"The sum of weights must equal 1.0. "
-                        f"For each criterion, provide at least 3 scoring levels (e.g., 0 for 'Does not meet expectations', "
-                        f"1 for 'Partially meets', 2 for 'Fully meets')."
-                    )
-
-                    # 4. Call the rubric-specific query engine
-                    rubric_response = query_engine3.query(prompt).response
-                    all_rubrics.append(rubric_response)
-                    print(f"--- Rubric generated successfully.")
-
-        # 5. Store all the generated rubrics in the context for later use
-        await ctx.store.set("generated_rubrics", all_rubrics)
-        print(f"\nSuccessfully generated and stored {len(all_rubrics)} rubrics.")
-
-        # Optional: Print the generated rubrics to verify
-        for rubric in all_rubrics:
-            print(rubric.model_dump_json(indent=2))'''
-
-
-        '''# Step 1: Create a rubric prompt
-        rubric_prompt = (
-            f"You are an expert rubric designer for a personalized AI training system. Your task is to generate a detailed evaluation rubric for each question, taking into account:"
-
-            f"1. The question's Bloom's taxonomy level (e.g., Remember, Understand, Apply, Analyze, Evaluate, Create). 2. The question type (short answer, long answer, or coding task). 3. The need for automated grading. 4. The system's mastery logic, based on the following scoring bands:"
+            question = rubric.question_text
             
-            f"Recommended Scoring Bands (Per Bloom Level)"
-            f"Mastered (≥ 80%, and no score < 60%) - skip this Bloom level"
-            f"Proficient (65-79%) - suggest optional content or confidence boost"
-            f"Needs Improvement (< 60%) - recommend targeted content based on rubric gap"
+            # Get the corresponding answer from the parsed file list
+            # If the index is out of bounds or the answer is empty, treat as skipped.
+            answer = student_answers[i] if i < len(student_answers) else ""
+            
+            print(f"--- Evaluating answer for: '{question[:50]}...'")
 
-            "Your output should include:"
+            # 4. Handle skipped or unanswered questions
+            if not answer:
+                print("--- Question SKIPPED by user (or no answer provided). Score: 0")
+                skipped_evaluation = EvaluationResult(
+                    question_text=question,
+                    score=0.0,
+                    justification="Question was skipped by the user or no answer was provided in the file.",
+                    criterion_feedback=[]
+                )
+                final_evaluations.append(skipped_evaluation)
+                continue # Move to the next rubric
 
-            "A. A **rubric table** with the following columns:"
-            "- Criterion: What is being evaluated (e.g., Accuracy, Completeness, Code Output)."
-            "- **Score Range**: The points range (e.g., 0-4)."
-            "- **Scoring Guide**: What earns full, partial, or no credit."
+            # 5. If an answer exists, proceed with LLM evaluation
+            rubric_json_string = rubric.model_dump_json(indent=2)
+            prompt = (
+                f"You are an expert teaching assistant. Evaluate the student's answer based on the provided rubric. "
+                f"Provide a final score and a detailed justification.\n\n"
+                f"**QUESTION:**\n{question}\n\n"
+                f"**EVALUATION RUBRIC (in JSON format):**\n{rubric_json_string}\n\n"
+                f"**STUDENT'S ANSWER:**\n{answer}\n\n"
+                f"Your evaluation must follow the rubric's criteria and weighting precisely. "
+                f"Provide specific feedback for each criterion."
+            )
 
-            "B. **Rubric rules tailored to Bloom's Level**:"
-            "- For *Remember/Understand*: Focus on correctness of facts, definitions, and completeness."
-            "- For *Apply/Analyze*: Include application of concepts, logical structure, and process."
-            "- For *Evaluate/Create*: Emphasize depth, justification, originality, or design reasoning."
-            "- For *Coding Questions*: Include criteria such as Correct Output, Code Quality, and Problem Solving."
+            evaluation_response = query_engine4.query(prompt).response
+            final_evaluations.append(evaluation_response)
+            
+            print(f"--- Evaluation complete.")
+            print(evaluation_response.model_dump_json(indent=2))
 
-            "C. **Allow partial credit** where applicable."
-
-            "D. **Support multiple solution paths** (especially for higher-order questions)."
-
-            "E. At the end, provide:"
-            "Minimum Passing Rule: Total score ≥ 70% AND no criterion < 50%."
-            f"These are the questions for which rubrik needs to be generated: {questions_str}\n\n"
-        )
-
-        rubric_response = query_engine2.query(rubric_prompt).response
-        print("\nGenerated Rubric:\n", rubric_response)'''
-
+        # 6. Store the final results
+        await ctx.store.set("final_evaluations", final_evaluations)
+        print(f"\nSuccessfully evaluated {len(final_evaluations)} answers.")
+        
         return StopEvent()
-        
-
-
 
 # ------ Workflow Execution ------
 async def main():
