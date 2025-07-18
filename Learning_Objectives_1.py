@@ -124,13 +124,14 @@ class EvaluationResult(BaseModel):
     criterion_feedback: List[Criterion_Feedback] = Field(description="Specific feedback for each criterion in the rubric.")
 
 llm1 = Settings.llm.as_structured_llm(Output)
-llm2 = Settings.llm.as_structured_llm(ModuleAssessment)
+llm2 = Settings.llm.as_structured_llm(Questions)
 llm3 = Settings.llm.as_structured_llm(Rubric)
 llm4 = Settings.llm.as_structured_llm(EvaluationResult)
 query_engine1 = index.as_query_engine(llm=llm1)
 query_engine2 = index.as_query_engine(llm=llm2)
 query_engine3 = index.as_query_engine(llm = llm3)
 query_engine4 = index.as_query_engine(llm=llm4)
+suggestion_query_engine = index.as_query_engine(llm=Settings.llm)
 
 # ------ Events ------
 
@@ -147,6 +148,10 @@ class RubrikEvent(Event):
 
 class EvalEvent(Event):
     query : str
+
+class SuggestionEvent(Event):
+    """Event to trigger remedial content suggestions."""
+    pass
 
 # ------ Workflow Definition ------
 
@@ -166,52 +171,67 @@ class Objective_Workflow(Workflow):
     @step
     async def get_objectives(self, ctx: Context, ev: GetObjectives) -> SetAssessment :
         """Query the index for the objectives based on course and module."""
-        query = f"You're a curriculum designer. Extract 3-6 broad learning objectives for {ev.module} module in {ev.course} course. Focus on the word broad because later i will need to create questions based on each Bloom's Taxonomy Level for each Learning objective that you give."
-        response = query_engine1.query(query)
-        Response = response.response  # Settings.llm.complete(prompt).text.strip()
-        #print(Response)
-        await ctx.store.set("objectives", Response.objectives)
+
+        course_name = ev.course.replace(" ", "_")
+        module_name = ev.module.replace(" ", "_")
+        objectives_file = f"{course_name}_{module_name}_objectives.json"
+
+        if os.path.exists(objectives_file):
+            print(f"Found existing objectives file. Loading from '{objectives_file}'...")
+            with open(objectives_file, 'r') as f:
+                objectives = json.load(f)
+        else:
+            print("No objectives file found. Generating new objectives...")
+            query = f"You're a curriculum designer. Generate 3-6 broad learning objectives for {ev.module} module in {ev.course} course. Focus on the word broad because later i will need to create questions based on each Bloom's Taxonomy Level for each Learning objective that you give. The learning objectives should be foused on covering the whole stored content of the module"
+            response = query_engine1.query(query).response
+            objectives = response.objectives
+            with open(objectives_file, 'w') as f:
+                json.dump(objectives, f, indent=4)
+            print(f"Objectives saved to '{objectives_file}'.")
+            
+        await ctx.store.set("all_objectives", objectives)
         
-        print(f"Course: {Response.course}")
-        print(f"Module: {Response.module}")
+        print(f"Course: {course_name}")
+        print(f"Module: {module_name}")
         print("\nObjectives:")
-        for i, objective in enumerate(Response.objectives, 1):
-            print(f"  {i}. {objective}")
+        for i, obj in enumerate(objectives, 1):
+            print(f"  {i}. {obj}\n")
        
-        return SetAssessment(query = "Set Assessment") #EvalEvent(query = "Start Evaluation") 
+        return SetAssessment(query = "Set Assessment") 
     
     @step
     async def assessment(self, ctx: Context, ev: SetAssessment) -> RubrikEvent:
         """Generate questions based on each Bloom's Taxonomy level for each learning objectives."""
         course = await ctx.store.get("course")
         module = await ctx.store.get("module")
-        objectives = await ctx.store.get("objectives", [])
-        if not objectives:
+        all_objectives = await ctx.store.get("all_objectives", [])
+        if not all_objectives:
             print("No learning objectives found.")
-        
-        query = f"Generate 3 questions based on each Bloom's Taxonomy level for each learning objective in {objectives} for the module {module} of the course {course}. "
+
+        choice = int(input("Please select the Learning Objective: "))-1
+        selected_objective = all_objectives[choice]
+        print(f"\nYou have selected: '{selected_objective}'")
+        await ctx.store.set("selected_objective", selected_objective)
+
+        query = f"Generate 3 questions based on each Bloom's Taxonomy level for the learning objective: {selected_objective} for the module: {module} of the course: {course}. "
         response = query_engine2.query(query).response
 
         # 1. Store the entire structured response in the context
-        print("Storing the generated assessment in the context store...")
         await ctx.store.set("generated_assessment", response)
 
         # 2. Nicely print the contents
         print("\n--- Generated Questions ---")
-        # Ensure the attribute name matches your Pydantic model (e.g., response.assessment)
-        list_of_questions = response.assessment 
-        
-        for question_obj in list_of_questions:
-            print(f"Objective: {question_obj.objective}\n")
-            bloom_levels = ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create']
-            for level in bloom_levels:
-                questions_for_level = getattr(question_obj, level)
-                if questions_for_level:
-                    print(f"  {level.capitalize()} Questions:")
-                    for i, q in enumerate(questions_for_level, 1):
-                        print(f"    {i}. {q}")
-                    print()
-            print("="*60 + "\n")
+
+        print(f"Objective: {response.objective}\n")
+        bloom_levels = ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create']
+        for level in bloom_levels:
+            questions_for_level = getattr(response, level)
+            if questions_for_level:
+                print(f"  {level.capitalize()} Questions:")
+                for i, q in enumerate(questions_for_level, 1):
+                    print(f"    {i}. {q}")
+                print()
+        print("="*60 + "\n")
             
         return RubrikEvent(query = "Make Evaluation Rubrik")
     
@@ -220,20 +240,14 @@ class Objective_Workflow(Workflow):
         """Generate an evaluation rubrik for the generated questions"""
 
         # Fetch the module assessment from context store
-        module_assessment = await ctx.store.get("generated_assessment")
-
-        target_index = 2
-
-        question_obj = module_assessment.assessment[target_index]
+        question_obj = await ctx.store.get("generated_assessment")
         
         print(f"Targeting objective: '{question_obj.objective}'")
 
         all_rubrics_for_objective = []
         objective_text = question_obj.objective
         
-        # The rest of the logic is the same, but it now operates only on the
-        # single 'question_obj' instead of looping through all of them.
-        for bloom_level in ['analyze']:
+        for bloom_level in ['Create']:
             questions_for_level = getattr(question_obj, bloom_level, [])
             
             for question_text in questions_for_level:
@@ -247,6 +261,7 @@ class Objective_Workflow(Workflow):
                     f"**Question:** \"{question_text}\"\n\n"
                     f"The rubric must have 2-4 weighted criteria. The sum of weights must equal 1.0. "
                     f"For each criterion, provide at least 3 scoring levels."
+                    f"Maximum marks for each question must be 10"
                 )
 
                 rubric_response = query_engine3.query(prompt).response
@@ -260,7 +275,7 @@ class Objective_Workflow(Workflow):
         return EvalEvent(query="Start the evaluation")
     
     @step
-    async def input_answers(self, ctx:Context, ev: EvalEvent)-> StopEvent:
+    async def input_answers(self, ctx:Context, ev: EvalEvent)-> StopEvent|SuggestionEvent:
         """Evaluate a student's answers against the generated rubrics."""
         print("Taking input from user...")
         answers_file_path = input("Please provide the path to your answers file:")
@@ -278,6 +293,7 @@ class Objective_Workflow(Workflow):
         student_answers = Parse_Answers_File.parse_answers_file(answers_file_path)
 
         final_evaluations = []
+        total_score = 0
         
         # 3. Loop through each rubric object
         for i, rubric_data in enumerate(rubrics_data):
@@ -321,6 +337,7 @@ class Objective_Workflow(Workflow):
 
             evaluation_response = query_engine4.query(prompt).response
             final_evaluations.append(evaluation_response)
+            total_score += evaluation_response.score
             
             print(f"--- Evaluation complete.")
             print(evaluation_response.model_dump_json(indent=2))
@@ -328,7 +345,44 @@ class Objective_Workflow(Workflow):
         # 6. Store the final results
         await ctx.store.set("final_evaluations", final_evaluations)
         print(f"\nSuccessfully evaluated {len(final_evaluations)} answers.")
+
+        # 7. Performance Analysis
+        average_score = total_score / (10*len(final_evaluations)) if final_evaluations else 0
+        print(f"\nCollective Average Score: {average_score:.2f}%")
+
+        if average_score < 60:
+            print("Performance is below 60%. Triggering remediation...")
+            return SuggestionEvent()
+        else:
+            print("Great work! You've mastered this section.")
+            return StopEvent() 
+    
+    @step
+    async def provide_suggestion(self, ctx: Context, ev: SuggestionEvent) -> StopEvent:
+        """Provide targeted reading suggestions based on poor performance."""
+        print("\n" + "="*50)
+        print("STEP: PROVIDING REMEDIATION")
+        print("="*50 + "\n")
         
+        objective = await ctx.store.get("selected_objective")
+        bloom_level = "remember"  
+
+        print("Based on your performance, here are some suggested readings from the course material to help you improve:\n")
+        
+        # Create a query to find relevant content in the indexed documents
+        remediation_query = f"Find content related to the learning objective '{objective}' focusing on the Bloom's Taxonomy level: '{bloom_level}' level of learning."
+        
+        # Use a standard query engine to get text results
+        response = suggestion_query_engine.query(remediation_query)
+
+        print(response.response)
+
+        # Print the source nodes (the relevant text chunks)
+        # for i, source_node in enumerate(response.source_nodes):
+        #     print(f"--- Reading Suggestion {i+1} (from: {source_node.metadata.get('topic', 'N/A')}) ---\n")
+        #     print(source_node.get_content())
+        #     print("\n" + "-"*50 + "\n")
+            
         return StopEvent()
 
 # ------ Workflow Execution ------
