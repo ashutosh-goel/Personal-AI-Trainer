@@ -2,6 +2,8 @@ from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Union
 from pathlib import Path
 import os
+import re
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.readers.file import PyMuPDFReader
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -21,6 +23,7 @@ from llama_index.core.workflow import (
     Context
 )
 import asyncio
+import time
 
 import os
 
@@ -28,12 +31,16 @@ from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 import Parse_Answers_File
 
+import google.generativeai as genai
+from google.genai.errors import ServerError
+from google.api_core import exceptions as api_exceptions
+
 api_key = "AIzaSyAlABTPGnaSlYkrWsmUwfmPjyq9tIjMsOs"  # Replace with your actual Google API key
 os.environ["GOOGLE_API_KEY"] = api_key
-llm = GoogleGenAI(model="gemini-2.5-flash")
-Settings.embed_model = GoogleGenAIEmbedding(model_name="gemini-embedding-exp-03-07", api_key=api_key)
+llm = GoogleGenAI(model="gemini-2.5-pro")
+Settings.embed_model = GoogleGenAIEmbedding(model_name="gemini-embedding-001", api_key=api_key)
 Settings.llm = GoogleGenAI(
-    model="gemini-2.5-flash",  # Use "gemma:7b" for the 7B model
+    model="gemini-2.5-pro",  # Use "gemma:7b" for the 7B model
     request_timeout=600.0,  # Set a longer timeout for larger models
 )
 
@@ -46,36 +53,165 @@ Settings.llm = Ollama(
     request_timeout=600.0,  # Set a longer timeout for larger models
 )'''
 
+ZILLIZ_URI = "https://in03-540f880b2b2a98e.serverless.gcp-us-west1.cloud.zilliz.com"
+ZILLIZ_TOKEN = "9326f5b4421b923f2649bda2c60f9b2f8fe20339831a0eed5c8d8a5e60d410fa511c1c8ad944b6ea6a4a645f622d367e0b5d42b2"
+VECTOR_DIM = 3072
+
+try:
+    milvus_client = MilvusClient(uri=ZILLIZ_URI, token=ZILLIZ_TOKEN)
+    print("Successfully connected to Zilliz with pymilvus client.")
+except Exception as e:
+    print(f"Failed to connect to Zilliz with pymilvus client: {e}")
+    exit()
+
+def sanitize_name(name: str) -> str:
+    """Sanitizes a string to be a valid Milvus collection or partition name."""
+    # Remove leading/trailing whitespace
+    name = name.strip()
+    # Replace invalid characters with underscores
+    name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    # Ensure it starts with a letter or underscore
+    if not re.match(r'^[a-zA-Z_]', name):
+        name = '_' + name
+    # Truncate to a reasonable length (Milvus has limits)
+    return name[:255]
+
+
 #------ Metadata Function ------
 def metadata(filepath: str):
     path = Path(filepath)
     course = path.parts[-3]  # Assuming structure: /Courses/CourseX/CourseX/ModuleY/Topic.pdf
     module = path.parts[-2]
-    topic = path.name
+    topic = path.stem
     return {"course": course, "module": module, "topic": topic}
 
+def index_source_documents_structured():
+    """
+    Reads all source documents, chunks them, and stores them in Zilliz
+    with a collection per module and a partition per topic (file).
+    """
+    print("\n--- Starting Structured Indexing of Source Documents ---")
+    reader = SimpleDirectoryReader(
+        input_dir=r"C:\Course2",
+        recursive=True,
+        file_extractor={".pdf": PyMuPDFReader()},
+        file_metadata=metadata
+    )
+    documents = reader.load_data(show_progress=True)
+    node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=20)
+
+    for doc in documents:
+        course_name = doc.metadata.get("course")
+        module_name = doc.metadata.get("module")
+        topic_name = doc.metadata.get("topic")
+
+        if not module_name or not topic_name:
+            print(f"Skipping document with missing metadata: {doc.metadata.get('file_path')}")
+            continue
+
+        collection_name = sanitize_name(f"{course_name}_{module_name}_source_docs")
+        partition_name = sanitize_name(topic_name)
+
+        # Create collection for the module if it doesn't exist
+        if not milvus_client.has_collection(collection_name):
+            print(f"Creating new source collection for module: '{collection_name}'")
+            schema = MilvusClient.create_schema(auto_id=True)
+            schema.add_field("id", DataType.INT64, is_primary=True)
+            schema.add_field("text", DataType.VARCHAR, max_length=4000) # Store the text chunk
+            schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
+            milvus_client.create_collection(collection_name=collection_name, schema=schema)
+
+            print(f"Creating index for collection '{collection_name}'...")
+            index_params = milvus_client.prepare_index_params()
+            index_params.add_index(
+                field_name="embedding",
+                index_type="AUTOINDEX",
+                metric_type="L2"
+            )
+            milvus_client.create_index(collection_name=collection_name, index_params=index_params)
+
+
+        # Create partition for the topic if it doesn't exist
+        if not milvus_client.has_partition(collection_name, partition_name):
+            print(f"Creating new partition for topic: '{partition_name}' in '{collection_name}'")
+            milvus_client.create_partition(collection_name, partition_name)
+        
+        # Check if partition already has content to avoid re-indexing
+        partition_stats = milvus_client.get_partition_stats(collection_name, partition_name)
+        if int(partition_stats.get('row_count', 0)) > 0:
+            print(f"Partition '{partition_name}' already contains data. Skipping indexing.")
+            continue
+
+        # Process and insert the document chunks
+        nodes = node_parser.get_nodes_from_documents([doc])
+        texts = [node.get_content() for node in nodes]
+
+        # Implement retry logic with exponential backoff for embedding generation
+        batch_size = 32
+        all_embeddings = []
+        max_retries = 3
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            
+            for attempt in range(max_retries):
+                try:
+                    print(f"Generating embeddings for batch {i//batch_size + 1}, attempt {attempt + 1}...")
+                    batch_embeddings = Settings.embed_model.get_text_embedding_batch(batch_texts, show_progress=False)
+                    all_embeddings.extend(batch_embeddings)
+                    time.sleep(1) # Add a small delay to be polite to the API
+                    break # If successful, exit the retry loop
+                # **FIXED**: Catch the correct ServerError exception using the module alias
+                except (ServerError, api_exceptions.InternalServerError) as e:
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** (attempt + 1)
+                        print(f"Server error encountered: {e}. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"Failed to generate embeddings after {max_retries} attempts. Aborting.")
+                        raise # Re-raise the exception to stop the script
+
+        data_to_insert = [{"text": text, "embedding": emb} for text, emb in zip(texts, all_embeddings)]
+
+
+        # batch_size = 32
+        # all_embeddings = []
+        # max_retries = 3
+        # for i in range(0, len(texts), batch_size):
+        #     batch_texts = texts[i:i + batch_size]
+
+        # embeddings = Settings.embed_model.get_text_embedding_batch(texts, show_progress=True)
+
+        # data_to_insert = [{"text": text, "embedding": emb} for text, emb in zip(texts, embeddings)]
+
+        if data_to_insert:
+            print(f"Inserting {len(data_to_insert)} chunks for topic '{topic_name}'...")
+            milvus_client.insert(collection_name, data_to_insert, partition_name=partition_name)
+    
+    print("--- Finished Structured Indexing ---")
+
+
 # ------ Indexing and Querying ------
-reader = SimpleDirectoryReader(
-    input_dir=r"C:\Courses1",
-    recursive=True,
-    file_extractor={".pdf": PyMuPDFReader()},
-    file_metadata=metadata
-)
+# reader = SimpleDirectoryReader(
+#     input_dir=r"C:\Courses1",
+#     recursive=True,
+#     file_extractor={".pdf": PyMuPDFReader()},
+#     file_metadata=metadata
+# )
 
 
-# Check if storage already exists
-Persist_Dir = "./storage_L1"
-if not os.path.exists(Persist_Dir):
-    os.makedirs(Persist_Dir)
-    # Load the documents, create the index
-    documents = reader.load_data()
-    index = VectorStoreIndex.from_documents(documents, show_progress=True)
-    # storing it
-    index.storage_context.persist(persist_dir=Persist_Dir)
-else:
-    # Load the index from storage
-    storage_context = StorageContext.from_defaults(persist_dir=Persist_Dir)
-    index = load_index_from_storage(storage_context)
+# # Check if storage already exists
+# Persist_Dir = "./storage_L1"
+# if not os.path.exists(Persist_Dir):
+#     os.makedirs(Persist_Dir)
+#     # Load the documents, create the index
+#     documents = reader.load_data()
+#     index = VectorStoreIndex.from_documents(documents, show_progress=True)
+#     # storing it
+#     index.storage_context.persist(persist_dir=Persist_Dir)
+# else:
+#     # Load the index from storage
+#     storage_context = StorageContext.from_defaults(persist_dir=Persist_Dir)
+#     index = load_index_from_storage(storage_context)
 
 # ------ Output Structure  ------
 
@@ -123,15 +259,15 @@ class EvaluationResult(BaseModel):
     justification: str = Field(description="A detailed explanation of how the score was determined based on the rubric criteria.")
     criterion_feedback: List[Criterion_Feedback] = Field(description="Specific feedback for each criterion in the rubric.")
 
-llm1 = Settings.llm.as_structured_llm(Output)
-llm2 = Settings.llm.as_structured_llm(Questions)
-llm3 = Settings.llm.as_structured_llm(Rubric)
-llm4 = Settings.llm.as_structured_llm(EvaluationResult)
-query_engine1 = index.as_query_engine(llm=llm1)
-query_engine2 = index.as_query_engine(llm=llm2)
-query_engine3 = index.as_query_engine(llm = llm3)
-query_engine4 = index.as_query_engine(llm=llm4)
-suggestion_query_engine = index.as_query_engine(llm=Settings.llm)
+# llm1 = Settings.llm.as_structured_llm(Output)
+# llm2 = Settings.llm.as_structured_llm(Questions)
+# llm3 = Settings.llm.as_structured_llm(Rubric)
+# llm4 = Settings.llm.as_structured_llm(EvaluationResult)
+# query_engine1 = index.as_query_engine(llm=llm1)
+# query_engine2 = index.as_query_engine(llm=llm2)
+# query_engine3 = index.as_query_engine(llm = llm3)
+# query_engine4 = index.as_query_engine(llm=llm4)
+# suggestion_query_engine = index.as_query_engine(llm=Settings.llm)
 
 # ------ Events ------
 
@@ -172,6 +308,26 @@ class Objective_Workflow(Workflow):
     async def get_objectives(self, ctx: Context, ev: GetObjectives) -> SetAssessment :
         """Query the index for the objectives based on course and module."""
 
+        # Dynamically connect to the correct source collection for the module
+        module_collection_name = sanitize_name(f"{ev.course}_{ev.module}_source_docs")
+
+        await ctx.store.set("module_collection_name", module_collection_name)
+        
+        if not milvus_client.has_collection(module_collection_name):
+            raise ValueError(f"Source collection '{module_collection_name}' not found. Please run the indexing script.")
+
+        print(f"\nConnecting to source collection for module: '{module_collection_name}'")
+        vector_store = MilvusVectorStore(
+            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM
+        )
+        module_index = VectorStoreIndex.from_vector_store(vector_store)
+        
+        # Store the module-specific index in the context for the next step
+        await ctx.store.set("module_index", module_index)
+
+        query_engine1 = module_index.as_query_engine(llm=Settings.llm.as_structured_llm(Output))
+        
+
         course_name = ev.course.replace(" ", "_")
         module_name = ev.module.replace(" ", "_")
         objectives_file = f"{course_name}_{module_name}_objectives.json"
@@ -182,17 +338,18 @@ class Objective_Workflow(Workflow):
                 objectives = json.load(f)
         else:
             print("No objectives file found. Generating new objectives...")
-            query = f"You're a curriculum designer. Generate 3-6 broad learning objectives for {ev.module} module in {ev.course} course. Focus on the word broad because later i will need to create questions based on each Bloom's Taxonomy Level for each Learning objective that you give. The learning objectives should be foused on covering the whole stored content of the module"
+            query = f"You're a curriculum designer. Generate 5-10 broad learning objectives for {ev.module} module in {ev.course} course. Focus on the word broad because later i will need to create questions based on each Bloom's Taxonomy Level for each Learning objective that you give. The learning objectives should be foused on covering the whole stored content of the module"
             response = query_engine1.query(query).response
             objectives = response.objectives
+
             with open(objectives_file, 'w') as f:
                 json.dump(objectives, f, indent=4)
             print(f"Objectives saved to '{objectives_file}'.")
-            
+        
         await ctx.store.set("all_objectives", objectives)
         
-        print(f"Course: {course_name}")
-        print(f"Module: {module_name}")
+        print(f"Course: {ev.course}")
+        print(f"Module: {ev.module}")
         print("\nObjectives:")
         for i, obj in enumerate(objectives, 1):
             print(f"  {i}. {obj}\n")
@@ -208,13 +365,49 @@ class Objective_Workflow(Workflow):
         if not all_objectives:
             print("No learning objectives found.")
 
+        # Retrieve the module-specific index from the context
+        #module_index = await ctx.store.get("module_index")
+
+        module_collection_name = await ctx.store.get("module_collection_name")
+        vector_store = MilvusVectorStore(
+            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM
+        )
+        module_index = VectorStoreIndex.from_vector_store(vector_store)
+
+        if not module_index:
+            raise ValueError("Module-specific index not found in workflow context.")
+        
+        query_engine2 = module_index.as_query_engine(llm=Settings.llm.as_structured_llm(Questions))
+
         choice = int(input("Please select the Learning Objective: "))-1
+        level_choice = int(input("Please select the level between 1-6"))-1
+        bloom_levels = ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create']
+        selected_level = bloom_levels[level_choice]
         selected_objective = all_objectives[choice]
         print(f"\nYou have selected: '{selected_objective}'")
+        print(f"\nLevel: '{selected_level}'")
         await ctx.store.set("selected_objective", selected_objective)
+        await ctx.store.set("selected_level", selected_level)
 
-        query = f"Generate 3 questions based on each Bloom's Taxonomy level for the learning objective: {selected_objective} for the module: {module} of the course: {course}. "
-        response = query_engine2.query(query).response
+        course_name = course.replace(" ", "_")
+        module_name = module.replace(" ", "_")
+        questions_file = f"{course_name}_{module_name}_{selected_objective}_{selected_level}_questions.json"
+
+        if os.path.exists(questions_file):
+            print(f"Found existing questions file. Loading from '{questions_file}'...")
+            with open(questions_file, 'r') as f:
+                questions = json.load(f)
+        else:
+
+
+            print("No questions file found. Generating new questions...")
+            query = f"Generate 3 questions based on '{selected_level}' Bloom's Taxonomy level for the learning objective: {selected_objective} for the module: {module} of the course: {course}. "
+            response = query_engine2.query(query).response
+
+            with open(objectives_file, 'w') as f:
+                json.dump(objectives, f, indent=4)
+            print(f"Questions saved to '{questions_file}'.")
+
 
         # 1. Store the entire structured response in the context
         await ctx.store.set("generated_assessment", response)
@@ -239,6 +432,13 @@ class Objective_Workflow(Workflow):
     async def evaluation_rubriks(self, ctx: Context, ev: RubrikEvent) -> EvalEvent:
         """Generate an evaluation rubrik for the generated questions"""
 
+        module_collection_name = await ctx.store.get("module_collection_name")
+        vector_store = MilvusVectorStore(
+            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM
+        )
+        module_index = VectorStoreIndex.from_vector_store(vector_store)
+        query_engine3 = module_index.as_query_engine(Settings.llm.as_structured_llm(Rubric))
+
         # Fetch the module assessment from context store
         question_obj = await ctx.store.get("generated_assessment")
         
@@ -247,7 +447,7 @@ class Objective_Workflow(Workflow):
         all_rubrics_for_objective = []
         objective_text = question_obj.objective
         
-        for bloom_level in ['Create']:
+        for bloom_level in ['Apply']:
             questions_for_level = getattr(question_obj, bloom_level, [])
             
             for question_text in questions_for_level:
@@ -277,6 +477,14 @@ class Objective_Workflow(Workflow):
     @step
     async def input_answers(self, ctx:Context, ev: EvalEvent)-> StopEvent|SuggestionEvent:
         """Evaluate a student's answers against the generated rubrics."""
+
+        module_collection_name = await ctx.store.get("module_collection_name")
+        vector_store = MilvusVectorStore(
+            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM
+        )
+        module_index = VectorStoreIndex.from_vector_store(vector_store)
+        query_engine4 = module_index.as_query_engine(Settings.llm.as_structured_llm(EvaluationResult))
+
         print("Taking input from user...")
         answers_file_path = input("Please provide the path to your answers file:")
         print(f"Received file path from user: {answers_file_path}")
@@ -360,6 +568,14 @@ class Objective_Workflow(Workflow):
     @step
     async def provide_suggestion(self, ctx: Context, ev: SuggestionEvent) -> StopEvent:
         """Provide targeted reading suggestions based on poor performance."""
+
+        module_collection_name = await ctx.store.get("module_collection_name")
+        vector_store = MilvusVectorStore(
+            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM
+        )
+        module_index = VectorStoreIndex.from_vector_store(vector_store)
+        query_engine5 = module_index.as_query_engine(Settings.llm)
+
         print("\n" + "="*50)
         print("STEP: PROVIDING REMEDIATION")
         print("="*50 + "\n")
@@ -373,7 +589,7 @@ class Objective_Workflow(Workflow):
         remediation_query = f"Find content related to the learning objective '{objective}' focusing on the Bloom's Taxonomy level: '{bloom_level}' level of learning."
         
         # Use a standard query engine to get text results
-        response = suggestion_query_engine.query(remediation_query)
+        response = query_engine5.query(remediation_query)
 
         print(response.response)
 
@@ -388,8 +604,9 @@ class Objective_Workflow(Workflow):
 # ------ Workflow Execution ------
 async def main():
 
-    workflow = Objective_Workflow()
-    await workflow.run(query = {"course": 'NodeJS', "module": '04 - Servers'})
+    index_source_documents_structured()
+    # workflow = Objective_Workflow()
+    # await workflow.run(query = {"course": 'NodeJS', "module": '04 - Servers'})
 
 if __name__ == "__main__":
     asyncio.run(main())
