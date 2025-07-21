@@ -4,9 +4,9 @@ from pathlib import Path
 import os
 import re
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.readers.file import PyMuPDFReader
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.readers.file import PDFReader
+# from llama_index.llms.ollama import Ollama
+# from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.core import SimpleDirectoryReader, Settings, StorageContext, load_index_from_storage, VectorStoreIndex
 from llama_index.vector_stores.milvus import MilvusVectorStore
 from pymilvus import MilvusClient, DataType
@@ -31,7 +31,7 @@ from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 import Parse_Answers_File
 
-import google.generativeai as genai
+# import google.generativeai as genai
 from google.genai.errors import ServerError
 from google.api_core import exceptions as api_exceptions
 
@@ -92,9 +92,9 @@ def index_source_documents_structured():
     """
     print("\n--- Starting Structured Indexing of Source Documents ---")
     reader = SimpleDirectoryReader(
-        input_dir=r"C:\Course2",
+        input_dir=r"C:\Users\ashut\Downloads\Courses",
         recursive=True,
-        file_extractor={".pdf": PyMuPDFReader()},
+        file_extractor={".pdf": PDFReader()},
         file_metadata=metadata
     )
     documents = reader.load_data(show_progress=True)
@@ -112,12 +112,26 @@ def index_source_documents_structured():
         collection_name = sanitize_name(f"{course_name}_{module_name}_source_docs")
         partition_name = sanitize_name(topic_name)
 
+        expected_fields = {"id", "text", "course", "module", "topic", "embedding"}
+
+        # **FIXED**: Add a check for schema mismatch in existing collections.
+        if milvus_client.has_collection(collection_name):
+            description = milvus_client.describe_collection(collection_name)
+            existing_fields = {field['name'] for field in description['fields']}
+            if not expected_fields.issubset(existing_fields):
+                print(f"\n[FATAL ERROR] Collection '{collection_name}' has an outdated schema.")
+                print(f"--> Expected to find fields: {expected_fields}")
+                print(f"--> But only found fields: {existing_fields}")
+                print("\nSOLUTION: Please delete this collection from your Zilliz Cloud dashboard and run the script again.")
+                exit() # Stop the script to prevent further errors.
+
         # Create collection for the module if it doesn't exist
         if not milvus_client.has_collection(collection_name):
             print(f"Creating new source collection for module: '{collection_name}'")
             schema = MilvusClient.create_schema(auto_id=True)
             schema.add_field("id", DataType.INT64, is_primary=True)
             schema.add_field("text", DataType.VARCHAR, max_length=4000) # Store the text chunk
+            schema.add_field("metadata", DataType.JSON)
             schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
             milvus_client.create_collection(collection_name=collection_name, schema=schema)
 
@@ -170,7 +184,26 @@ def index_source_documents_structured():
                         print(f"Failed to generate embeddings after {max_retries} attempts. Aborting.")
                         raise # Re-raise the exception to stop the script
 
-        data_to_insert = [{"text": text, "embedding": emb} for text, emb in zip(texts, all_embeddings)]
+        data_to_insert = []
+        for text, emb in zip(texts, all_embeddings):
+            metadata_payload = {
+                "_node_content": json.dumps({"text": text}), # Serialize the node content
+                "course": course_name,
+                "module": module_name,
+                "topic": topic_name,
+            }
+            data_to_insert.append({
+                "text": text, 
+                "embedding": emb,
+                "metadata": metadata_payload
+            })
+
+        if data_to_insert:
+            print(f"Inserting {len(data_to_insert)} chunks for topic '{topic_name}'...")
+            milvus_client.insert(collection_name, data_to_insert, partition_name=partition_name)
+    
+    print("--- Finished Structured Indexing ---")
+
 
 
         # batch_size = 32
@@ -182,12 +215,6 @@ def index_source_documents_structured():
         # embeddings = Settings.embed_model.get_text_embedding_batch(texts, show_progress=True)
 
         # data_to_insert = [{"text": text, "embedding": emb} for text, emb in zip(texts, embeddings)]
-
-        if data_to_insert:
-            print(f"Inserting {len(data_to_insert)} chunks for topic '{topic_name}'...")
-            milvus_client.insert(collection_name, data_to_insert, partition_name=partition_name)
-    
-    print("--- Finished Structured Indexing ---")
 
 
 # ------ Indexing and Querying ------
@@ -318,9 +345,28 @@ class Objective_Workflow(Workflow):
 
         print(f"\nConnecting to source collection for module: '{module_collection_name}'")
         vector_store = MilvusVectorStore(
-            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM
+            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name='React_01___Getting_started_with_React_source_docs', dim=VECTOR_DIM, text_field="text"
         )
+
+        client = MilvusClient(
+            uri=ZILLIZ_URI,
+            token=ZILLIZ_TOKEN
+        )
+
+        # Use query() to fetch the first 3 entities from the partition
+        res = client.query(
+            collection_name="React_01___Getting_started_with_React_source_docs",
+            partition_names=["_01_01_Introduction_to_React___The_Power_of_Modern_UI_Development"],
+            # An empty filter fetches all, limit restricts the count
+            filter="",
+            limit=3,
+            output_fields=["embedding", "text", "course", "module", "topic"]
+        )
+
+        print(res)
+
         module_index = VectorStoreIndex.from_vector_store(vector_store)
+        
         
         # Store the module-specific index in the context for the next step
         await ctx.store.set("module_index", module_index)
@@ -370,7 +416,7 @@ class Objective_Workflow(Workflow):
 
         module_collection_name = await ctx.store.get("module_collection_name")
         vector_store = MilvusVectorStore(
-            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM
+            uri=ZILLIZ_URI, token=ZILLIZ_TOKEN, collection_name=module_collection_name, dim=VECTOR_DIM, text_field="text"
         )
         module_index = VectorStoreIndex.from_vector_store(vector_store)
 
@@ -397,16 +443,16 @@ class Objective_Workflow(Workflow):
             print(f"Found existing questions file. Loading from '{questions_file}'...")
             with open(questions_file, 'r') as f:
                 questions = json.load(f)
+            query = f"Generate 3 questions based on '{selected_level}' Bloom's Taxonomy level for the learning objective: {selected_objective} for the module: {module} of the course: {course}. The generated questions should not be exactly similar to these questions {questions}, either paraphrase them or generate new questions."
         else:
-
-
             print("No questions file found. Generating new questions...")
             query = f"Generate 3 questions based on '{selected_level}' Bloom's Taxonomy level for the learning objective: {selected_objective} for the module: {module} of the course: {course}. "
-            response = query_engine2.query(query).response
+        
+        response = query_engine2.query(query).response
 
-            with open(objectives_file, 'w') as f:
-                json.dump(objectives, f, indent=4)
-            print(f"Questions saved to '{questions_file}'.")
+        with open(questions_file, 'a+') as f:
+            json.dump(response, f, indent=4)
+        print(f"Questions saved to '{questions_file}'.")
 
 
         # 1. Store the entire structured response in the context
@@ -605,8 +651,8 @@ class Objective_Workflow(Workflow):
 async def main():
 
     index_source_documents_structured()
-    # workflow = Objective_Workflow()
-    # await workflow.run(query = {"course": 'NodeJS', "module": '04 - Servers'})
+    workflow = Objective_Workflow()
+    await workflow.run(query = {"course": 'React', "module": '01___Getting_started_with_React'})
 
 if __name__ == "__main__":
     asyncio.run(main())
